@@ -1,0 +1,27 @@
+# Maintainer: Andreas Reichel <andreas (at) manticore-projects.com>
+pkgname=aurscan
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Claude-powered pre-build malware scanner for AUR packages (yay wrapper + editor-gate)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/manticore-projects/aurscan"
+license=('Apache-2.0')
+makedepends=('go')
+optdepends=('yay: syay wrapper and --update-check'
+            'xdg-utils: open mail client for mailing-list reports')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # fill in on release
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CGO_ENABLED=0
+  go build -trimpath -ldflags="-s -w" -o aurscan .
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 aurscan "$pkgdir/usr/bin/aurscan"
+  ln -s aurscan "$pkgdir/usr/bin/syay"
+  ln -s aurscan "$pkgdir/usr/bin/aurscan-edit"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
