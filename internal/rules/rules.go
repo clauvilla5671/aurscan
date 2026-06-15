@@ -69,7 +69,11 @@ var catalog = []Rule{
 	// --- Critical: privilege / persistence ----------------------------------
 	mk("PRIV-001", "sudo/pkexec in PKGBUILD", Critical, `(?i)\b(sudo|pkexec)\s`),
 	mk("PRIV-003", "sudoers modification", Critical, `(?i)/etc/sudoers`),
-	mk("INSTALL-003", "Network in install script", Critical, `(?i)(curl|wget|nc|ncat)\b`),
+	// INSTALL-003 is scoped to .install files in Scan (network access in a hook
+	// that runs on the user's machine is the threat). The pattern requires a
+	// command-like invocation, so a bare "nc" inside C code, a licence string
+	// (CC-BY-NC-SA) or base64 signature data no longer matches.
+	mk("INSTALL-003", "Network in install script", Critical, `(?i)\b(curl|wget|ncat)\b|\bnc\s+-{0,2}\w`),
 	mk("PERSIST-001", "systemd service creation", Critical, `(?i)(systemctl\s+enable|/etc/systemd/system/.*\.service|/usr/lib/systemd/system/.*\.service)`),
 	mk("PERSIST-002", "systemd timer creation", Critical, `(?i)\.timer\b|OnBootSec|OnCalendar`),
 	mk("PERSIST-004", "boot script modification", Critical, `(?i)/etc/rc\.local|/etc/profile\.d/`),
@@ -88,26 +92,86 @@ var catalog = []Rule{
 	mk("OBF-003", "hex-encoded payload", High, `(\\x[0-9a-fA-F]{2}){4,}`),
 	mk("CHK-005", "non-VCS source uses SKIP", High, `(?i)sha256sums=\([^)]*SKIP`),
 	mk("URL-001", "raw IP in URL", High, `https?://\d{1,3}(\.\d{1,3}){3}`),
-	mk("URL-002", "URL shortener", High, `(?i)(bit\.ly|tinyurl\.com|t\.co|is\.gd)`),
-	mk("URL-003", "dynamic DNS host", High, `(?i)(duckdns\.org|no-ip\.|ddns\.net)`),
+	// Anchored to a scheme + path so "t.co" no longer matches inside
+	// "redhat.com" / "githubusercontent.com".
+	mk("URL-002", "URL shortener", High, `(?i)https?://(bit\.ly|tinyurl\.com|t\.co|is\.gd|goo\.gl|ow\.ly|buff\.ly|rebrand\.ly|cutt\.ly|shorturl\.at)/`),
+	mk("URL-003", "dynamic DNS host", High, `(?i)https?://[a-z0-9.\-]*(duckdns\.org|no-ip\.(com|org|biz|net)|ddns\.net|hopto\.org|zapto\.org)\b`),
 	mk("HIDDEN-002", "execution from /tmp", High, `(?i)/tmp/\S+\.(sh|py|pl)\b`),
 	mk("ENV-002", "PATH overwrite", High, `(?m)^\s*PATH=`),
 	// --- Medium: weaker signals ---------------------------------------------
 	mk("NET-001", "HTTP source URL", Medium, `(?i)source=\([^)]*http://`),
-	mk("SRC-001", "git source on personal host", Medium, `(?i)git\+https?://(github|gitlab)\.com/[^/]+/`),
+	// SRC-001 is handled specially in Scan via the reputable-host allowlist
+	// (it cannot be expressed as a single regex); see checkGitHosts.
 }
 
 // VCS sources legitimately use SKIP; avoid flagging CHK-005 for them.
 var vcsLine = regexp.MustCompile(`(?i)^\s*source=.*\b(git|svn|hg|bzr)\+`)
 
+// commentLine matches a full-line shell/INI/desktop comment. Only whole-line
+// comments are stripped: inline "# ..." is NOT treated as a comment because a
+// PKGBUILD URL fragment (e.g. "...nomacs.git#tag=${pkgver}") legitimately
+// contains '#'.
+var commentLine = regexp.MustCompile(`^[ \t]*#`)
+
+// gitSourceHost captures the host of a VCS source URL, e.g.
+// `git+https://github.com/u/r.git` -> "github.com".
+var gitSourceHost = regexp.MustCompile(`(?i)\b(?:git|svn|hg|bzr)\+https?://([a-z0-9.\-]+)`)
+
+// reputableGitHosts is an allowlist of well-known forges and official
+// distribution / upstream Git hosts. A VCS source on any of these is normal and
+// must not be flagged by SRC-001. Extend via the user instructions file or a
+// future config knob rather than editing this list in place.
+var reputableGitHosts = map[string]bool{
+	// major public forges
+	"github.com": true, "www.github.com": true,
+	"gitlab.com": true, "codeberg.org": true, "git.sr.ht": true,
+	"bitbucket.org":   true,
+	"sourceforge.net": true, "git.code.sf.net": true,
+	// freedesktop / GNOME / KDE / X.Org
+	"gitlab.freedesktop.org": true, "anongit.freedesktop.org": true,
+	"gitlab.gnome.org": true, "invent.kde.org": true,
+	"gitlab.x.org": true,
+	// distributions
+	"gitlab.archlinux.org": true, "aur.archlinux.org": true,
+	"salsa.debian.org": true,
+	"pagure.io":        true, "src.fedoraproject.org": true,
+	"code.opensuse.org": true,
+	"git.launchpad.net": true, "launchpad.net": true,
+	// kernel / GNU / Apache / OpenStack
+	"git.kernel.org":       true,
+	"git.savannah.gnu.org": true, "git.savannah.nongnu.org": true,
+	"savannah.gnu.org": true, "savannah.nongnu.org": true,
+	"gitbox.apache.org": true, "opendev.org": true,
+}
+
+// isReputableGitHost reports whether host is on the allowlist, including the
+// per-project *.googlesource.com mirrors (android, chromium, …).
+func isReputableGitHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if reputableGitHosts[host] {
+		return true
+	}
+	return strings.HasSuffix(host, ".googlesource.com")
+}
+
 // Scan runs the catalog over a set of files and returns hits, de-duplicated by
-// (code, file). SRC-001 is informational and only meaningful alongside other
-// signals, so it is reported but never escalates on its own.
+// (code, file). Matches that fall on a full-line comment are ignored, since a
+// commented-out line is inert. SRC-001 is informational and only meaningful
+// alongside other signals, so it is reported but never escalates on its own.
 func Scan(files map[string]string) []Hit {
 	var hits []Hit
 	seen := map[string]bool{}
+	add := func(code, name string, sev Severity, file, snippet string) {
+		key := code + "|" + file
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		hits = append(hits, Hit{Code: code, Name: name, Severity: sev, File: file, Snippet: snippet})
+	}
 	for name, text := range files {
 		isPKGBUILD := name == "PKGBUILD" || strings.HasSuffix(name, "/PKGBUILD")
+		isInstall := strings.HasSuffix(name, ".install")
 		hasVCS := false
 		for _, ln := range strings.Split(text, "\n") {
 			if vcsLine.MatchString(ln) {
@@ -116,26 +180,30 @@ func Scan(files map[string]string) []Hit {
 			}
 		}
 		for _, r := range catalog {
-			// SRC-001 noise control: only on PKGBUILD.
-			if r.Code == "SRC-001" && !isPKGBUILD {
+			// INSTALL-003 only applies to .install hook scripts.
+			if r.Code == "INSTALL-003" && !isInstall {
 				continue
 			}
-			loc := r.re.FindStringIndex(text)
-			if loc == nil {
+			// Find the first match that is not on a commented-out line.
+			idx := firstLiveMatch(text, r.re)
+			if idx < 0 {
 				continue
 			}
 			if r.Code == "CHK-005" && hasVCS {
 				continue // SKIP is expected for VCS sources
 			}
-			key := r.Code + "|" + name
-			if seen[key] {
-				continue
+			add(r.Code, r.Name, r.Severity, name, lineAround(text, idx))
+		}
+		// SRC-001: flag VCS sources on hosts that are NOT well-known forges or
+		// official distribution / upstream Git hosts. Only on PKGBUILD.
+		if isPKGBUILD {
+			for _, m := range gitSourceHost.FindAllStringSubmatchIndex(text, -1) {
+				start, host := m[0], text[m[2]:m[3]]
+				if isCommentAt(text, start) || isReputableGitHost(host) {
+					continue
+				}
+				add("SRC-001", "git source on uncommon host", Medium, name, lineAround(text, start))
 			}
-			seen[key] = true
-			hits = append(hits, Hit{
-				Code: r.Code, Name: r.Name, Severity: r.Severity,
-				File: name, Snippet: lineAround(text, loc[0]),
-			})
 		}
 	}
 	sort.Slice(hits, func(i, j int) bool {
@@ -145,6 +213,30 @@ func Scan(files map[string]string) []Hit {
 		return hits[i].Code < hits[j].Code
 	})
 	return hits
+}
+
+// firstLiveMatch returns the start offset of the first match of re that does not
+// fall on a full-line comment, or -1 if there is none.
+func firstLiveMatch(text string, re *regexp.Regexp) int {
+	for _, loc := range re.FindAllStringIndex(text, -1) {
+		if !isCommentAt(text, loc[0]) {
+			return loc[0]
+		}
+	}
+	return -1
+}
+
+// isCommentAt reports whether the line containing offset idx is a full-line
+// shell/desktop comment.
+func isCommentAt(text string, idx int) bool {
+	start := strings.LastIndexByte(text[:idx], '\n') + 1
+	end := strings.IndexByte(text[start:], '\n')
+	if end < 0 {
+		end = len(text)
+	} else {
+		end += start
+	}
+	return commentLine.MatchString(text[start:end])
 }
 
 // Worst returns the highest severity among hits ("" if none).
